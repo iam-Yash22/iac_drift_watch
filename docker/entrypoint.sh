@@ -4,7 +4,8 @@ set -eu
 export PORT="${PORT:-8000}"
 export APP_MODULE="${APP_MODULE:-main:app}"
 export APP_SERVER="${APP_SERVER:-gunicorn}"
-export GUNICORN_WORKERS="${GUNICORN_WORKERS:-2}"
+# Presence and email throttling are per-process; shared storage is needed before scaling workers.
+export GUNICORN_WORKERS="${GUNICORN_WORKERS:-1}"
 export GUNICORN_WORKER_CLASS="${GUNICORN_WORKER_CLASS:-uvicorn.workers.UvicornWorker}"
 
 if [ -n "${DATABASE_URL:-}" ] || [ -n "${POSTGRES_HOST:-}" ] || [ -n "${DB_HOST:-}" ]; then
