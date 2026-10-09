@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.auth.oauth2 import oauth2_scheme
 from app.crud.crud_user import crud_user
 from app.db.session import get_db
+from app.presence import touch
 from app.schemas.token import TokenPayload
 from app.schemas.user import UserRead
 from app.security import jwt, rate_limiter
@@ -35,6 +36,7 @@ def get_current_user(
     user = crud_user.get(db, id=int(user_id))
     if user is None:
         raise credentials_exception
+    touch(user.id)
     return user
 
 

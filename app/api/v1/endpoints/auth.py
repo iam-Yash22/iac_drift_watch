@@ -1,10 +1,11 @@
 """Authentication endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.api import deps
+from app import presence
 from app.auth import auth as auth_service
 from app.auth import token as auth_token
 from app.schemas import token as token_schema
@@ -20,12 +21,20 @@ async def login(
     db: Session = Depends(deps.get_db),
 ) -> token_schema.Token:
     """Authenticate a user and return JWT access and refresh tokens."""
-    _, tokens = await user_service.authenticate_user(
+    user, tokens = await user_service.authenticate_user(
         db,
         form_data.username,
         form_data.password,
     )
+    presence.touch(user.id)
     return tokens
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(current_user: object = Depends(deps.get_current_user)) -> Response:
+    """Clear the user's in-process active-presence marker."""
+    presence.clear(getattr(current_user, "id", None))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/me", response_model=user_schema.UserRead)

@@ -9,7 +9,6 @@ Registered in ``app.factory.create_app`` and executed once per process:
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
@@ -22,46 +21,11 @@ from app.core.logging_config import configure_logging, get_logger
 from app.db.init_db import init_db
 from app.db.session import check_db_connectivity, dispose_engine
 from app.db.session import SessionLocal
-from app.models.account import AwsAccount
 from app.models.scan import Scan
-from app.services.drift_orchestrator import _run_scan_background
-
-
-def _scan_interval_minutes() -> int:
-    try:
-        interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
-    except ValueError:
-        return 15
-    return max(interval, 1)
-
-
-async def _run_scheduled_scan(account_id: int) -> None:
-    with SessionLocal() as db:
-        scan = Scan(account_id=account_id, status="queued")
-        db.add(scan)
-        db.commit()
-        db.refresh(scan)
-        await _run_scan_background(str(account_id), "scheduled", db=db, scan_id=scan.id)
-
-
-def _configure_scan_scheduler(scheduler: AsyncIOScheduler, logger: object) -> None:
-    interval_minutes = _scan_interval_minutes()
-    with SessionLocal() as db:
-        accounts = db.query(AwsAccount).all()
-
-    for account in accounts:
-        scheduler.add_job(
-            _run_scheduled_scan,
-            trigger="interval",
-            minutes=interval_minutes,
-            args=[account.id],
-            id=f"account_scan_{account.id}",
-            replace_existing=True,
-        )
-    logger.info(
-        "account scan scheduler configured",
-        extra={"account_count": len(accounts), "interval_minutes": interval_minutes},
-    )
+from app.services.scheduled_drift_email import (
+    drift_scan_interval_minutes,
+    run_scheduled_drift_email_scan,
+)
 
 
 @asynccontextmanager
@@ -108,16 +72,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("database bootstrap complete")
 
     scheduler = AsyncIOScheduler()
-    _configure_scan_scheduler(scheduler, logger)
+    interval_minutes = drift_scan_interval_minutes()
+    scheduler.add_job(
+        run_scheduled_drift_email_scan,
+        trigger="interval",
+        minutes=interval_minutes,
+        id="scheduled_drift_email_scan",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc),
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     app.state.scheduler = scheduler
-    logger.info("account scan scheduler started")
+    logger.info(
+        "drift email scheduler started",
+        extra={"interval_minutes": interval_minutes},
+    )
 
     try:
         yield
     finally:
         scheduler.shutdown()
-        logger.info("account scan scheduler stopped")
+        logger.info("drift email scheduler stopped")
 
         await asyncio.to_thread(dispose_engine)
         logger.info("database engine disposed")

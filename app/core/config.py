@@ -301,6 +301,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SCAN_STALE_MINUTES"),
         description="Age in minutes before queued/running scans are treated as orphaned.",
     )
+    drift_email_interval_minutes: int = Field(
+        default=15,
+        ge=1,
+        validation_alias=AliasChoices("DRIFT_EMAIL_INTERVAL_MINUTES"),
+        description="Minimum interval between email notifications for the same account owner.",
+    )
 
     @property
     def gmail_address(self) -> str | None:

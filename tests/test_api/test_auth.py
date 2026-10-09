@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -7,6 +8,8 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.api.v1.endpoints.users import delete_user, update_user
+from app.api.v1.endpoints import auth as auth_endpoint
+from app.auth import dependencies as auth_dependencies
 from app.core.config import DEFAULT_BOOTSTRAP_ADMIN_PASSWORD, settings
 from app.core.constants import Role
 from app.lifespan import lifespan
@@ -44,6 +47,74 @@ def test_protected_endpoint_access_with_auth(client, auth_headers):
         assert resp.status_code in (200, 401, 405), f"Unexpected status from {path}: {resp.status_code}"
         return
     pytest.skip("No protected 'me' endpoint found")
+
+
+def test_authenticated_dependency_touches_presence(monkeypatch):
+    user = SimpleNamespace(id=17)
+    touch = Mock()
+    monkeypatch.setattr(auth_dependencies.jwt, "decode_token", lambda token: {"sub": "17"})
+    monkeypatch.setattr(auth_dependencies.crud_user, "get", lambda db, id: user)
+    monkeypatch.setattr(auth_dependencies, "touch", touch)
+
+    assert auth_dependencies.get_current_user(db=object(), token="test-token") is user
+    touch.assert_called_once_with(17)
+
+
+def test_invalid_token_does_not_touch_presence(monkeypatch):
+    touch = Mock()
+    monkeypatch.setattr(auth_dependencies.jwt, "decode_token", lambda token: None)
+    monkeypatch.setattr(auth_dependencies, "touch", touch)
+
+    with pytest.raises(HTTPException) as exc_info:
+        auth_dependencies.get_current_user(db=object(), token="invalid-token")
+
+    assert exc_info.value.status_code == 401
+    touch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_login_and_logout_update_presence(monkeypatch):
+    user = SimpleNamespace(id=17)
+    tokens = object()
+    touch = Mock()
+    clear = Mock()
+    monkeypatch.setattr(
+        auth_endpoint.user_service,
+        "authenticate_user",
+        AsyncMock(return_value=(user, tokens)),
+    )
+    monkeypatch.setattr(auth_endpoint.presence, "touch", touch)
+    monkeypatch.setattr(auth_endpoint.presence, "clear", clear)
+
+    result = await auth_endpoint.login(
+            form_data=SimpleNamespace(username="alice", password="x"),
+        db=object(),
+    )
+    response = auth_endpoint.logout(user)
+
+    assert result is tokens
+    assert response.status_code == 204
+    touch.assert_called_once_with(17)
+    clear.assert_called_once_with(17)
+
+
+@pytest.mark.asyncio
+async def test_failed_login_does_not_touch_presence(monkeypatch):
+    touch = Mock()
+    monkeypatch.setattr(
+        auth_endpoint.user_service,
+        "authenticate_user",
+        AsyncMock(side_effect=ValueError("invalid credentials")),
+    )
+    monkeypatch.setattr(auth_endpoint.presence, "touch", touch)
+
+    with pytest.raises(ValueError, match="invalid credentials"):
+        await auth_endpoint.login(
+            form_data=SimpleNamespace(username="alice", password="x"),
+            db=object(),
+        )
+
+    touch.assert_not_called()
 
 
 @pytest.mark.asyncio
