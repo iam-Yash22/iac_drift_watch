@@ -11,6 +11,8 @@ dist/
 logs/
 bak_alerts/
 /*.sqlite3
+reports/
+baseline-before.txt
 
 *.pyc
 
