@@ -191,6 +191,17 @@ def fetch_elastic_beanstalk_environments(eb_client: Any) -> List[Dict[str, Any]]
     return environments
 
 
+RESOURCE_TYPES_BY_FETCHER = {
+    "fetch_ec2_instances": frozenset({"ec2_instance"}),
+    "fetch_security_groups": frozenset({"security_group"}),
+    "fetch_rds_instances": frozenset({"rds_instance"}),
+    "fetch_iam_roles": frozenset({"iam_role"}),
+    "fetch_s3_buckets": frozenset({"s3_bucket"}),
+    "fetch_lambda_functions": frozenset({"lambda_function"}),
+    "fetch_elastic_beanstalk_environments": frozenset({"elastic_beanstalk_environment"}),
+}
+
+
 __all__ = [
     "fetch_ec2_instances",
     "fetch_security_groups",
@@ -199,4 +210,5 @@ __all__ = [
     "fetch_s3_buckets",
     "fetch_lambda_functions",
     "fetch_elastic_beanstalk_environments",
+    "RESOURCE_TYPES_BY_FETCHER",
 ]

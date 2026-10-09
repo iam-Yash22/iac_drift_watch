@@ -637,7 +637,7 @@ def test_manual_scan_accepts_aws_account_id_path(client, db_session, monkeypatch
     assert response.json()["account_id"] == str(account.id)
 
 
-def test_manual_scan_runs_background_orchestrator_and_persists_results(client, db_session, monkeypatch):
+def _run_manual_scan_with_reference(client, db_session, monkeypatch, baseline, comparison, live_configuration=None):
     user = User(
         username="scan-user",
         email="scan@example.com",
@@ -659,7 +659,7 @@ def test_manual_scan_runs_background_orchestrator_and_persists_results(client, d
     monkeypatch.setattr(
         drift_orchestrator,
         "_load_terraform_reference",
-        lambda *args: [{"resource_id": "live-resource", "resource_type": "ec2_instance"}],
+        lambda *args: baseline,
     )
     ec2_client = mock.MagicMock()
     ec2_client.get_paginator.return_value.paginate.return_value = [{"Reservations": []}]
@@ -688,7 +688,7 @@ def test_manual_scan_runs_background_orchestrator_and_persists_results(client, d
                     "resource_type": "ec2_instance",
                     "region": "us-east-1",
                     "tags": {},
-                    "configuration": {"instance_type": "t3.micro"},
+                    "configuration": live_configuration or {"instance_type": "t3.micro"},
                 }
             ]
         ),
@@ -696,17 +696,7 @@ def test_manual_scan_runs_background_orchestrator_and_persists_results(client, d
     monkeypatch.setattr(
         drift_orchestrator.drift_engine,
         "compare_resources",
-        mock.AsyncMock(
-            return_value={
-                "drifts": [
-                    {
-                        "resource_id": "live-resource",
-                        "change_type": "modified",
-                        "severity": "high",
-                    }
-                ]
-            }
-        ),
+        mock.AsyncMock(return_value=comparison),
     )
     monkeypatch.setattr(
         deps.aws_client_factory,
@@ -729,6 +719,58 @@ def test_manual_scan_runs_background_orchestrator_and_persists_results(client, d
         .one()
     )
     assert persisted_resource.resource_type == "ec2_instance"
+    return account, persisted_resource, publish
+
+
+def test_manual_scan_skips_resource_missing_from_baseline(client, db_session, monkeypatch):
+    baseline = [{"resource_id": "different-resource", "resource_type": "ec2_instance"}]
+    comparison = {
+        "drifts": [{
+            "resource_id": "live-resource",
+            "resource_type": "ec2_instance",
+            "is_drifted": True,
+            "diffs": {"resource": {"desired": None, "actual": {"id": "live-resource"}}},
+        }]
+    }
+    _, persisted_resource, publish = _run_manual_scan_with_reference(
+        client,
+        db_session,
+        monkeypatch,
+        baseline,
+        comparison,
+    )
+
+    assert all(item["resource_id"] != "live-resource" for item in baseline)
+    assert len(persisted_resource.drift_records) == 0
+    publish.assert_not_called()
+
+
+def test_manual_scan_persists_and_publishes_drift_for_baselined_resource(client, db_session, monkeypatch):
+    baseline = [{
+        "resource_id": "live-resource",
+        "resource_type": "ec2_instance",
+        "configuration": {"instance_type": "t2.micro"},
+    }]
+    live_configuration = {"instance_type": "t3.micro"}
+    comparison = {
+        "drifts": [{
+            "resource_id": "live-resource",
+            "change_type": "modified",
+            "severity": "high",
+        }]
+    }
+
+    account, persisted_resource, publish = _run_manual_scan_with_reference(
+        client,
+        db_session,
+        monkeypatch,
+        baseline,
+        comparison,
+        live_configuration,
+    )
+
+    assert any(item["resource_id"] == "live-resource" for item in baseline)
+    assert baseline[0]["configuration"]["instance_type"] != live_configuration["instance_type"]
     assert len(persisted_resource.drift_records) == 1
     publish.assert_called_once_with(
         "DriftDetectedEvent",

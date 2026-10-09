@@ -267,10 +267,13 @@ def compare(desired: NormalizedResource, actual: NormalizedResource) -> DriftRes
 def compare_resources(
     desired_resources: Iterable[Any],
     actual_resources: Iterable[Any],
+    missing_live_resource_types: Iterable[str] = (),
 ) -> List[DriftResult]:
-    """Compare every live resource with its matching desired resource."""
+    """Compare desired resources with live state in both directions."""
     desired = list(desired_resources or [])
+    eligible_missing_live_types = set(missing_live_resource_types)
     results: List[DriftResult] = []
+    matched_desired: set[int] = set()
 
     type_map = {
         "aws_s3_bucket": "s3_bucket",
@@ -338,6 +341,7 @@ def compare_resources(
             )
             continue
 
+        matched_desired.add(id(match))
         desired_arn = getattr(match, "arn", None)
         actual_arn = getattr(actual, "arn", None)
         desired_attributes = getattr(match, "attributes", {}) or {}
@@ -399,6 +403,34 @@ def compare_resources(
                 diffs=result.diffs,
                 summary=result.summary,
                 is_known_exception=result.is_known_exception,
+            )
+        )
+
+    for item in desired:
+        if id(item) in matched_desired:
+            continue
+        resource_id = getattr(item, "resource_id", None) or getattr(item, "id", None)
+        resource_type = getattr(item, "resource_type", None) or getattr(item, "type", None)
+        if getattr(item, "mode", None) in {"data", "unmanaged"}:
+            continue
+        if resource_type not in eligible_missing_live_types:
+            continue
+        desired_payload = {
+            "resource_id": str(resource_id or ""),
+            "resource_type": str(resource_type or ""),
+            "resource_name": str(getattr(item, "resource_name", None) or getattr(item, "name", None) or ""),
+            "arn": str(getattr(item, "arn", None) or ""),
+            "properties": getattr(item, "properties", None) or getattr(item, "attributes", {}) or {},
+            "tags": getattr(item, "tags", {}) or {},
+        }
+        results.append(
+            DriftResult(
+                resource_id=str(resource_id or ""),
+                resource_type=str(resource_type or ""),
+                is_drifted=True,
+                severity=Severity.CRITICAL,
+                diffs={"resource": {"desired": desired_payload, "actual": None}},
+                summary="Resource exists in desired state but is missing from live state.",
             )
         )
 

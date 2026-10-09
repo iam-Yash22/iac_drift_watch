@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 import app.drift.engine as engine
@@ -132,6 +134,19 @@ def test_ec2_arn_mismatch_is_ignored():
 
     assert results[0].is_drifted is False
     assert results[0].diffs == {}
+
+
+@pytest.mark.parametrize("mode", ("data", "unmanaged"))
+def test_missing_live_comparison_skips_non_managed_baseline_resources(mode):
+    desired = [
+        SimpleNamespace(
+            resource_id="i-123",
+            resource_type="ec2_instance",
+            mode=mode,
+        )
+    ]
+
+    assert engine.compare_resources(desired, [], {"ec2_instance"}) == []
 
 
 def test_compare_resources_returns_one_result_per_actual_resource():

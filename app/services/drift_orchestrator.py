@@ -2,16 +2,10 @@ from pathlib import Path
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import asyncio
-from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
 import json
-import os
-import re
-import smtplib
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 import inspect
-from email.message import EmailMessage
 
 from fastapi import BackgroundTasks
 from fastapi.encoders import jsonable_encoder
@@ -86,75 +80,6 @@ def _scan_result(comparison: Any, total_resources: int) -> Dict[str, Any]:
         "drifts": drifts,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
     })
-
-
-async def _send_alert_email(
-    account_id: Any,
-    resource_id: str,
-    resource_type: str,
-    severity: str,
-    diffs: Dict[str, Any],
-    owner_name: str = "there",
-    scan_id: Any = "latest",
-) -> None:
-    address = settings.alert_sender_email or settings.gmail_address
-    app_password = settings.alert_sender_app_password or settings.gmail_app_password
-    if not address or not app_password:
-        logger.info("alert email skipped resource_id=%s reason=missing_gmail_settings", resource_id)
-        return
-
-    recipient = os.getenv("ALERT_TEST_RECIPIENT") or address
-
-    diff_lines = [
-        f"- {key}: desired={value.get('desired')!r}, actual={value.get('actual')!r}"
-        for key, value in diffs.items()
-        if isinstance(value, dict)
-    ]
-    message = EmailMessage()
-    message["Subject"] = f"IaC DriftWatch alert: {resource_id}"
-    message["From"] = address
-    message["To"] = recipient
-    message.set_content(
-        f"Hi {owner_name}, drift was detected on account {account_id}.\n\n"
-        f"View scan details: {settings.app_base_url}/accounts/{account_id}/scans/{scan_id}\n\n"
-        f"Account ID: {account_id}\n"
-        f"Resource ID: {resource_id}\n"
-        f"Resource type: {resource_type}\n"
-        f"Severity: {severity}\n\n"
-        "Diffs:\n"
-        + ("\n".join(diff_lines) if diff_lines else "- None")
-    )
-    logger.info("alert email body resource_id=%s body=%s", resource_id, message.get_content().strip())
-
-    def send() -> None:
-        debug_output = StringIO()
-        try:
-            with redirect_stdout(debug_output), redirect_stderr(debug_output):
-                with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
-                    smtp.set_debuglevel(1)
-                    smtp.starttls()
-                    smtp.login(address, app_password.get_secret_value())
-                    smtp.send_message(message)
-        finally:
-            auth_exchange = False
-            for line in debug_output.getvalue().splitlines():
-                if re.search(r"send:\s+['\"]?AUTH\b", line, re.IGNORECASE):
-                    auth_exchange = True
-                    line = re.sub(r"(send:\s+).*$", r"\1[REDACTED]", line, flags=re.IGNORECASE)
-                elif auth_exchange and re.search(r"(?:send:|reply:)", line, re.IGNORECASE):
-                    auth_complete = bool(re.search(r"reply:\s+235\b", line, re.IGNORECASE))
-                    line = re.sub(r"(send:|reply:).*$", r"\1 [REDACTED]", line, flags=re.IGNORECASE)
-                    if auth_complete:
-                        auth_exchange = False
-                elif re.search(r"password|secret", line, re.IGNORECASE):
-                    line = re.sub(r"(password|secret)([=: ]+).*$", r"\1\2[REDACTED]", line, flags=re.IGNORECASE)
-                logger.info("smtp debug %s", line)
-
-    try:
-        await asyncio.to_thread(send)
-        logger.info("alert email sent resource_id=%s", resource_id)
-    except Exception:
-        logger.error("alert email failed resource_id=%s", resource_id, exc_info=True)
 
 
 def trigger_account_scan(
@@ -239,7 +164,7 @@ async def _call_available(module: Any, candidates: List[str], *args, **kwargs) -
 
 def _state_resource_to_baseline(resource: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Convert one Terraform state resource into a comparison baseline."""
-    if resource.get("mode") == "data":
+    if resource.get("mode") in {"data", "unmanaged"}:
         return None
     resource_type = resource.get("type")
     type_map = {
@@ -376,6 +301,28 @@ def _load_terraform_reference(account_id: int, db: Session) -> List[Any]:
     return []
 
 
+def _filter_unmatched_live_resources(comparison: Any) -> Any:
+    items = _drift_items(comparison)
+    filtered = []
+    skipped_resource_ids: set[str] = set()
+    for item in items:
+        diffs = item.get("diffs") or {}
+        resource_diff = diffs.get("resource") or {}
+        resource_id = item.get("resource_id") or item.get("id")
+        if item.get("is_drifted", True) and "desired" in resource_diff and resource_diff["desired"] is None:
+            skipped_resource_ids.add(str(resource_id) if resource_id is not None else "")
+            logger.info("skipped unmatched live resource_id=%s reason=no_baseline", resource_id)
+            continue
+        filtered.append(item)
+    if not skipped_resource_ids:
+        return comparison
+    if isinstance(comparison, dict):
+        comparison = {**comparison, "drifts": filtered}
+    elif isinstance(comparison, list):
+        comparison = filtered
+    return comparison
+
+
 def _coerce_account_id(value: Any) -> Any:
     if value is None:
         return value
@@ -444,36 +391,46 @@ async def orchestrate_account_scan(account_id: str, trigger: str = "scheduled", 
 
         # Fetch live resources using fetchers
         live_raw: Dict[str, Any] = {}
+        fetched_resource_types: set[str] = set()
+
+        async def fetch(fetcher_name: str, client: Any, *args: Any) -> Any:
+            result = await _maybe_await(
+                getattr(aws_resource_fetchers, fetcher_name)(client, *args)
+            )
+            fetched_resource_types.update(
+                aws_resource_fetchers.RESOURCE_TYPES_BY_FETCHER[fetcher_name]
+            )
+            return result
+
         try:
             ec2 = clients.get("ec2") if isinstance(clients, dict) else clients
             if ec2:
-                live_raw["ec2_instances"] = await _maybe_await(aws_resource_fetchers.fetch_ec2_instances(ec2))
+                live_raw["ec2_instances"] = await fetch("fetch_ec2_instances", ec2)
 
             s3 = clients.get("s3") if isinstance(clients, dict) else None
             if s3:
-                live_raw["s3_buckets"] = await _maybe_await(aws_resource_fetchers.fetch_s3_buckets(s3))
+                live_raw["s3_buckets"] = await fetch("fetch_s3_buckets", s3)
 
             iam = clients.get("iam") if isinstance(clients, dict) else None
             if iam:
-                live_raw["iam_roles"] = await _maybe_await(aws_resource_fetchers.fetch_iam_roles(iam))
+                live_raw["iam_roles"] = await fetch("fetch_iam_roles", iam)
 
             rds = clients.get("rds") if isinstance(clients, dict) else None
             if rds:
-                live_raw["rds_instances"] = await _maybe_await(aws_resource_fetchers.fetch_rds_instances(rds))
+                live_raw["rds_instances"] = await fetch("fetch_rds_instances", rds)
 
             if ec2:
-                live_raw["security_groups"] = await _maybe_await(aws_resource_fetchers.fetch_security_groups(ec2))
+                live_raw["security_groups"] = await fetch("fetch_security_groups", ec2)
 
             lambda_client = clients.get("lambda") if isinstance(clients, dict) else None
             if lambda_client:
-                live_raw["lambda_functions"] = await _maybe_await(
-                    aws_resource_fetchers.fetch_lambda_functions(lambda_client)
-                )
+                live_raw["lambda_functions"] = await fetch("fetch_lambda_functions", lambda_client)
 
             elastic_beanstalk = clients.get("elasticbeanstalk") if isinstance(clients, dict) else None
             if elastic_beanstalk:
-                live_raw["elastic_beanstalk_environments"] = await _maybe_await(
-                    aws_resource_fetchers.fetch_elastic_beanstalk_environments(elastic_beanstalk)
+                live_raw["elastic_beanstalk_environments"] = await fetch(
+                    "fetch_elastic_beanstalk_environments",
+                    elastic_beanstalk,
                 )
         except Exception as exc:
             raise exceptions.ServiceError(f"Failed to fetch live resources: {exc}") from exc
@@ -485,9 +442,17 @@ async def orchestrate_account_scan(account_id: str, trigger: str = "scheduled", 
 
         # Compare
         try:
-            comparison = await _maybe_await(drift_engine.compare_resources(tf_resources, live_resources))
+            comparison = await _maybe_await(
+                drift_engine.compare_resources(
+                    tf_resources,
+                    live_resources,
+                    missing_live_resource_types=fetched_resource_types,
+                )
+            )
         except Exception as exc:
             raise exceptions.ServiceError(f"Drift comparison failed: {exc}") from exc
+
+        comparison = _filter_unmatched_live_resources(comparison)
 
         # Persist resources for the owning account in the database.
         resource_store = getattr(crud_resource, "crud_resource", crud_resource)
@@ -585,7 +550,23 @@ async def orchestrate_account_scan(account_id: str, trigger: str = "scheduled", 
                 db.commit()
 
             drift_items = _drift_items(comparison)
-            created_alerts: List[Dict[str, Any]] = []
+            current_resource_ids = {str(item.get("resource_id") or item.get("id")) for item in drift_items if (item.get("resource_id") or item.get("id")) is not None}
+            for tracked_resource in (
+                db.query(resource_store.model)
+                .filter(resource_store.model.account_id == resolved_account_id)
+                .all()
+            ):
+                if str(tracked_resource.resource_id) in current_resource_ids:
+                    continue
+                latest = (
+                    db.query(drift_model)
+                    .filter(drift_model.tracked_resource_id == tracked_resource.id)
+                    .order_by(drift_model.id.desc())
+                    .first()
+                )
+                if latest is not None and not latest.reconciled:
+                    latest.reconciled = True
+                    logger.info("drift reconciled resource_id=%s reason=no_baseline", tracked_resource.resource_id)
             for item in drift_items:
                 resource_id = item.get("resource_id") or item.get("id")
                 if item.get("is_known_exception", False):
@@ -622,12 +603,6 @@ async def orchestrate_account_scan(account_id: str, trigger: str = "scheduled", 
                 if drift_record is None:
                     logger.info("alert skipped resource_id=%s reason=drift_record_not_found", resource_id)
                     continue
-                owner = getattr(account, "owner", None)
-                owner_name = (
-                    getattr(owner, "username", None)
-                    or getattr(owner, "email", None)
-                    or "there"
-                )
                 db.add(
                     Alert(
                         account_id=resolved_account_id,
@@ -640,20 +615,8 @@ async def orchestrate_account_scan(account_id: str, trigger: str = "scheduled", 
                         summary=str(item.get("summary", "Drift detected.")),
                     )
                 )
-                created_alerts.append(
-                    {
-                        "resource_id": str(resource_id),
-                        "resource_type": str(item.get("resource_type", "unknown")),
-                        "severity": str(item.get("severity", "low")),
-                        "diffs": jsonable_encoder(item.get("diffs", {})),
-                        "owner_name": owner_name,
-                        "scan_id": scan.id if scan is not None else "latest",
-                    }
-                )
                 logger.info("alert created resource_id=%s", resource_id)
             db.commit()
-            for alert in created_alerts:
-                await _send_alert_email(resolved_account_id, **alert)
         except Exception as exc:
             logger.error("alert creation failed", exc_info=True)
             raise exceptions.ServiceError("Failed to persist drift results") from exc
