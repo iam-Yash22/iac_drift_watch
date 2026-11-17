@@ -23,6 +23,6 @@ Password: password
 
 ## Current Status
 
-The project is up in running on :- https://iac-drift-watch.onrender.com/signin
+The project is up in running on :- https://iac-drift-watch.onrender.com
 
 NOTE:- Render Blocks SMTP services across all services , Hence the SMTP Email trigger won't work for the online (Render) Deployment .
